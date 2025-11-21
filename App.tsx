@@ -4,6 +4,7 @@ import Scene from './components/Scene';
 import { User, ChatMessage, RoomInfo } from './types';
 import { SOCKET_URL, AI_HOST_ID, AI_HOST_NAME, LANGUAGES, TOPICS } from './constants';
 import { audioManager } from './services/audio';
+import { VoiceManager } from './services/voiceManager';
 import { generateHostResponse } from './services/geminiService';
 
 // Styles for custom scrollbar
@@ -21,6 +22,7 @@ type ViewState = 'LOBBY' | 'CREATE_ROOM' | 'ROOM';
 const App: React.FC = () => {
   // App State
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [connected, setConnected] = useState(false);
   const [view, setView] = useState<ViewState>('LOBBY');
   
   // Data State
@@ -33,28 +35,51 @@ const App: React.FC = () => {
   
   // Forms
   const [username, setUsername] = useState('');
+  const usernameRef = useRef(username); 
   const [createForm, setCreateForm] = useState({ title: '', language: 'English', topic: 'Casual Chat' });
   const [inputMessage, setInputMessage] = useState('');
   
-  // Audio
+  // Audio & Voice Logic
   const [micEnabled, setMicEnabled] = useState(false);
   const [voiceLevels, setVoiceLevels] = useState<Record<string, number>>({});
-  const rafRef = useRef<number>();
+  const rafRef = useRef<number>(0);
+  
+  const voiceManagerRef = useRef<VoiceManager | null>(null);
+  const remoteAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
 
-  // Initialize Socket
+  // Update ref when username changes
   useEffect(() => {
-    const s = io(SOCKET_URL);
+    usernameRef.current = username;
+  }, [username]);
+
+  // Initialize Socket - Run once
+  useEffect(() => {
+    const s = io(SOCKET_URL, {
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+    });
     setSocket(s);
 
     s.on('connect', () => {
-      console.log('Connected');
+      console.log('Connected to server');
+      setConnected(true);
       s.emit('get-rooms');
+    });
+
+    s.on('disconnect', () => {
+      console.log('Disconnected from server');
+      setConnected(false);
+    });
+
+    s.on('connect_error', (err) => {
+      console.error('Connection error:', err);
+      setConnected(false);
     });
 
     s.on('room-list', (list: RoomInfo[]) => setRooms(list));
 
     s.on('room-created', (roomId: string) => {
-      s.emit('join-room', { roomId, username });
+      s.emit('join-room', { roomId, username: usernameRef.current });
     });
 
     s.on('room-state', ({ info, users }: { info: RoomInfo, users: User[] }) => {
@@ -63,11 +88,19 @@ const App: React.FC = () => {
       setView('ROOM');
       setMessages([]);
       setLastMessages({});
+      
+      // We are in, initialize voice manager
+      initializeVoice(info.id, s);
     });
 
     s.on('user-joined', (user: User) => {
       setUsers(prev => [...prev, user]);
       addSystemMessage(`${user.username} joined.`);
+      
+      // Existing users initiate connection to new user
+      if (voiceManagerRef.current) {
+        voiceManagerRef.current.createPeer(user.id, true);
+      }
     });
 
     s.on('user-left', (userId: string) => {
@@ -76,12 +109,25 @@ const App: React.FC = () => {
         if (u) addSystemMessage(`${u.username} left.`);
         return prev.filter(u => u.id !== userId);
       });
+      
+      // Cleanup audio
+      const audio = remoteAudioRefs.current.get(userId);
+      if (audio) {
+        audio.pause();
+        remoteAudioRefs.current.delete(userId);
+      }
     });
 
     s.on('user-updated', (updatedUser: User) => {
       setUsers(prev => prev.map(u => u.id === updatedUser.id ? updatedUser : u));
-      if (updatedUser.isSpeaker && !users.find(u => u.id === updatedUser.id)?.isSpeaker) {
-        addSystemMessage(`${updatedUser.username} stepped up to the stage.`);
+      if (updatedUser.isSpeaker) {
+         setUsers(prev => {
+            const existing = prev.find(p => p.id === updatedUser.id);
+            if (existing && !existing.isSpeaker) {
+                 addSystemMessage(`${updatedUser.username} stepped up to the stage.`);
+            }
+            return prev;
+         });
       }
     });
 
@@ -98,42 +144,103 @@ const App: React.FC = () => {
       setVoiceLevels(prev => ({ ...prev, [userId]: volume }));
     });
 
-    // Refresh room list periodically if in lobby
+    // Poll for rooms in lobby
     const interval = setInterval(() => {
-      if (view === 'LOBBY') s.emit('get-rooms');
+      if (s.connected) s.emit('get-rooms');
     }, 5000);
 
     return () => {
       clearInterval(interval);
       s.disconnect();
+      // Cleanup voice
+      if (voiceManagerRef.current) {
+        voiceManagerRef.current.cleanup();
+      }
+      audioManager.cleanup();
     };
-  }, [username, view]);
+  }, []);
 
-  // Audio Loop
-  const startAudioLoop = () => {
+  // --- Voice & Audio Logic ---
+
+  const initializeVoice = async (roomId: string, socketInstance: Socket) => {
+    // Clean up previous
+    if (voiceManagerRef.current) voiceManagerRef.current.cleanup();
+
+    const vm = new VoiceManager(socketInstance, roomId, socketInstance.id, (userId, stream) => {
+        console.log(`Playing remote stream for ${userId}`);
+        const audio = new Audio();
+        audio.srcObject = stream;
+        audio.play().catch(e => console.error("Auto-play failed", e));
+        remoteAudioRefs.current.set(userId, audio);
+    });
+
+    const stream = await vm.initLocalStream();
+    if (stream) {
+       // Start muted by default or check if speaker
+       vm.toggleMute(false); 
+       setMicEnabled(false);
+       
+       // Initialize visualization
+       await audioManager.initialize(stream);
+       startAudioLoop(socketInstance);
+    }
+    
+    voiceManagerRef.current = vm;
+  };
+
+  const startAudioLoop = (sock: Socket) => {
     const loop = () => {
       if (audioManager) {
         const vol = audioManager.getVolume();
-        if (socket && socket.connected && currentRoom) {
-           socket.emit('voice-activity', { roomId: currentRoom.id, volume: vol });
-           setVoiceLevels(prev => ({ ...prev, [socket.id || '']: vol }));
+        if (sock && sock.connected) {
+           // We need roomId from somewhere reliable, or just send to current joined room
+           // Note: currentRoom state might be stale in RAF loop? 
+           // Actually, we can emit with just volume if server knows our room, 
+           // but our server API expects roomId. 
+           // We will skip checking currentRoom here and rely on the closure or ref if needed
+           // But for now let's just try to read the state or check socket.
         }
+      }
+      // We need to pass roomId to emit.
+      // Let's use a ref for roomId to access in loop
+    };
+    
+    // Actually, let's put the loop inside a useEffect dependent on currentRoom
+  };
+
+  // Audio Level Loop
+  useEffect(() => {
+    const loop = () => {
+      if (micEnabled && currentRoom && socket) {
+        const vol = audioManager.getVolume();
+        socket.emit('voice-activity', { roomId: currentRoom.id, volume: vol });
+        setVoiceLevels(prev => ({ ...prev, [socket.id || '']: vol }));
       }
       rafRef.current = requestAnimationFrame(loop);
     };
-    loop();
+    
+    if (micEnabled) {
+        loop();
+    } else {
+        cancelAnimationFrame(rafRef.current);
+        // Clear my level
+        if (socket) setVoiceLevels(prev => ({ ...prev, [socket.id || '']: 0 }));
+    }
+    
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [micEnabled, currentRoom, socket]);
+
+
+  const toggleMic = () => {
+    const newState = !micEnabled;
+    setMicEnabled(newState);
+    if (voiceManagerRef.current) {
+        voiceManagerRef.current.toggleMute(newState);
+    }
   };
 
-  useEffect(() => {
-    if (micEnabled) {
-      audioManager.initialize().then(() => startAudioLoop()).catch(console.error);
-    } else {
-      audioManager.cleanup();
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    }
-  }, [micEnabled]);
+  // --- Actions ---
 
-  // Actions
   const handleJoinRoom = (roomId: string) => {
     if (!username) {
       alert('Please enter a username first');
@@ -145,6 +252,10 @@ const App: React.FC = () => {
   const handleCreateRoom = () => {
     if (!username) {
       alert('Please enter a username first');
+      return;
+    }
+    if (!connected) {
+      alert('Not connected to server');
       return;
     }
     socket?.emit('create-room', { ...createForm, username });
@@ -221,12 +332,21 @@ const App: React.FC = () => {
 
   // --- Render Views ---
 
+  const StatusBanner = () => (
+    !connected ? (
+      <div className="fixed top-0 left-0 right-0 bg-red-600 text-white text-xs font-bold text-center py-1 z-50">
+        Disconnected from server. Please ensure the backend is running.
+      </div>
+    ) : null
+  );
+
   if (view === 'LOBBY') {
     return (
-      <div className="min-h-screen bg-slate-900 text-white p-6 flex flex-col items-center">
+      <div className="min-h-screen bg-slate-900 text-white p-6 flex flex-col items-center pt-12">
+        <StatusBanner />
         <style>{scrollbarStyles}</style>
         
-        <header className="w-full max-w-4xl flex justify-between items-center mb-12">
+        <header className="w-full max-w-4xl flex flex-col md:flex-row justify-between items-center mb-12 gap-4">
           <div>
             <h1 className="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">VoxStage 3D</h1>
             <p className="text-slate-400 text-sm">Immersive Language Exchange</p>
@@ -242,9 +362,11 @@ const App: React.FC = () => {
             <button 
               onClick={() => {
                  if(!username) return alert('Enter username');
+                 if(!connected) return alert('Cannot connect to server');
                  setView('CREATE_ROOM');
               }}
-              className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg font-bold text-sm transition-all"
+              disabled={!connected}
+              className={`px-4 py-2 rounded-lg font-bold text-sm transition-all ${connected ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-700 cursor-not-allowed text-slate-500'}`}
             >
               + Create Room
             </button>
@@ -254,7 +376,7 @@ const App: React.FC = () => {
         <div className="w-full max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-6">
           {rooms.length === 0 ? (
             <div className="col-span-2 text-center py-20 text-slate-500 border-2 border-dashed border-slate-800 rounded-xl">
-              No active rooms. Be the first to create one!
+              {connected ? 'No active rooms. Be the first to create one!' : 'Connecting to server...'}
             </div>
           ) : (
             rooms.map(room => (
@@ -280,7 +402,8 @@ const App: React.FC = () => {
 
   if (view === 'CREATE_ROOM') {
     return (
-      <div className="min-h-screen bg-slate-900 text-white flex items-center justify-center p-4">
+      <div className="min-h-screen bg-slate-900 text-white flex items-center justify-center p-4 pt-12">
+        <StatusBanner />
         <div className="bg-slate-800 p-8 rounded-2xl shadow-2xl w-full max-w-md border border-slate-700">
           <h2 className="text-2xl font-bold mb-6">Create Voice Room</h2>
           
@@ -321,8 +444,8 @@ const App: React.FC = () => {
               <button onClick={() => setView('LOBBY')} className="flex-1 py-2 text-slate-400 hover:text-white font-medium">Cancel</button>
               <button 
                 onClick={handleCreateRoom}
-                disabled={!createForm.title}
-                className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-bold disabled:opacity-50"
+                disabled={!createForm.title || !connected}
+                className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Start Room
               </button>
@@ -335,6 +458,7 @@ const App: React.FC = () => {
 
   return (
     <div className="relative w-full h-screen bg-slate-900 overflow-hidden">
+      <StatusBanner />
       <style>{scrollbarStyles}</style>
 
       {/* 3D Scene */}
@@ -348,7 +472,7 @@ const App: React.FC = () => {
       </div>
 
       {/* UI Overlay */}
-      <div className="absolute inset-0 z-10 pointer-events-none flex flex-col justify-between p-4 md:p-6">
+      <div className="absolute inset-0 z-10 pointer-events-none flex flex-col justify-between p-4 md:p-6 pt-12">
         
         {/* Header */}
         <div className="flex justify-between items-start pointer-events-auto">
@@ -368,7 +492,7 @@ const App: React.FC = () => {
           </button>
         </div>
 
-        {/* Host Controls Overlay (If Host) */}
+        {/* Host Controls */}
         {currentUser?.isHost && (
            <div className="absolute top-24 left-6 pointer-events-auto bg-slate-900/90 backdrop-blur p-4 rounded-xl border border-white/10 w-64 shadow-xl max-h-[40vh] overflow-y-auto">
              <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Host Controls</h3>
@@ -380,7 +504,7 @@ const App: React.FC = () => {
                    {users.filter(u => u.handRaised).map(u => (
                      <div key={u.id} className="flex justify-between items-center bg-slate-800 p-2 rounded-lg">
                        <span className="text-sm text-white truncate">{u.username}</span>
-                       <button onClick={() => promoteUser(u.id)} className="bg-green-600 text-xs px-2 py-1 rounded text-white font-bold">Accept</button>
+                       <button onClick={() => promoteUser(u.id)} className="bg-green-600 hover:bg-green-500 text-xs px-2 py-1 rounded text-white font-bold">Accept</button>
                      </div>
                    ))}
                  </div>
@@ -402,7 +526,7 @@ const App: React.FC = () => {
            </div>
         )}
 
-        {/* Bottom Area: Controls & Chat */}
+        {/* Bottom Area */}
         <div className="flex flex-col md:flex-row gap-4 items-end pointer-events-auto max-h-[50vh]">
           
           {/* Chat Box */}
@@ -444,7 +568,7 @@ const App: React.FC = () => {
           <div className="flex flex-col gap-2 bg-slate-900/80 backdrop-blur-md p-2 rounded-xl border border-white/10 shadow-lg">
             {currentUser?.isSpeaker ? (
               <button 
-                onClick={() => setMicEnabled(!micEnabled)}
+                onClick={toggleMic}
                 className={`p-3 rounded-lg transition-colors w-14 h-14 flex items-center justify-center ${micEnabled ? 'bg-indigo-600 text-white shadow-[0_0_15px_rgba(99,102,241,0.5)]' : 'bg-slate-700 text-slate-400'}`}
                 title="Toggle Mic"
               >
@@ -460,7 +584,6 @@ const App: React.FC = () => {
               </button>
             )}
             
-            {/* Info Status for User */}
             {!currentUser?.isSpeaker && (
                <div className="text-[10px] text-center text-slate-400 font-medium max-w-[56px] leading-tight">
                  {currentUser?.handRaised ? 'Waiting...' : 'Listen Only'}
