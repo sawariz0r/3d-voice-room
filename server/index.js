@@ -62,7 +62,6 @@ io.on('connection', (socket) => {
     socket.join(roomId);
     
     const isHost = room.info.hostId === socket.id;
-    // Host is always speaker. Others are audience by default.
     const isSpeaker = isHost; 
 
     const user = {
@@ -99,12 +98,17 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Voice Activity
+  // Voice Activity (Visualizer)
   socket.on('voice-activity', ({ roomId, volume }) => {
     socket.to(roomId).emit('user-voice-activity', {
       userId: socket.id,
       volume
     });
+  });
+
+  // --- WebRTC Signaling ---
+  socket.on('signal', ({ userToSignal, signal, callerId }) => {
+    io.to(userToSignal).emit('signal', { signal, callerId });
   });
 
   // --- Stage Management ---
@@ -126,14 +130,13 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     if (!room) return;
     
-    // Verify requester is host
     if (room.info.hostId !== socket.id) return;
 
     const user = room.users.find(u => u.id === userId);
     if (user) {
       user.isSpeaker = true;
       user.handRaised = false;
-      user.position = getStagePosition(); // Move to stage
+      user.position = getStagePosition();
       
       room.info.speakerCount = room.users.filter(u => u.isSpeaker).length;
 
@@ -147,11 +150,10 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     if (!room) return;
     
-    // Only host can move others, or user moves themselves
     if (room.info.hostId !== socket.id && socket.id !== userId) return;
 
     const user = room.users.find(u => u.id === userId);
-    if (user && user.id !== room.info.hostId) { // Host cannot be moved to audience
+    if (user && user.id !== room.info.hostId) {
       user.isSpeaker = false;
       user.handRaised = false;
       user.position = getAudiencePosition();
@@ -176,12 +178,9 @@ io.on('connection', (socket) => {
         io.to(roomId).emit('user-left', socket.id);
         io.to(roomId).emit('room-info-update', room.info);
 
-        // If host left, maybe close room or assign new host? 
-        // For this POC, we'll just leave the room open but leaderless or delete if empty.
         if (room.users.length === 0) {
           delete rooms[roomId];
         } else if (wasHost) {
-             // Simple host transfer to first user
              room.info.hostId = room.users[0].id;
              room.users[0].isHost = true;
              room.users[0].isSpeaker = true;
