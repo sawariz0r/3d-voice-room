@@ -4,10 +4,9 @@ export class AudioManager {
   private microphone: MediaStreamAudioSourceNode | null = null;
   private dataArray: Uint8Array | null = null;
 
-  async initialize(): Promise<void> {
+  // Initialize with an existing stream (from VoiceManager) to avoid double mic requests
+  async initialize(stream: MediaStream): Promise<void> {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       this.analyser = this.audioContext.createAnalyser();
       this.analyser.fftSize = 256;
