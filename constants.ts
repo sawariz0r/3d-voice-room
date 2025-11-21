@@ -1,4 +1,4 @@
-export const SOCKET_URL = 'http://localhost:3001'; // In production, this would be dynamic
+export const SOCKET_URL = 'https://api.3dvoice.prpl.se'; // In production, this would be dynamic
 
 export const AI_HOST_ID = 'ai-host-gemini';
 export const AI_HOST_NAME = 'AI Tutor';
