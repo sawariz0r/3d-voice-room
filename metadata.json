@@ -1,0 +1,7 @@
+{
+  "name": "VoxStage 3D",
+  "description": "A 3D immersive voice room experience with spatial context, visual voice activity detection, and an AI-powered host.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
